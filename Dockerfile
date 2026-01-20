@@ -20,5 +20,5 @@ COPY . .
 # Install the project itself
 RUN poetry install --no-interaction --no-ansi --only main
 
-# Run the bot
-CMD ["python", "-m", "app.main"]
+# Run migrations and start the bot
+CMD ["sh", "-c", "alembic upgrade head && python -m app.main"]

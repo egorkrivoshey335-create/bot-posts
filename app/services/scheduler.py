@@ -48,8 +48,34 @@ async def shutdown_scheduler() -> None:
 
 async def restore_scheduled_jobs() -> None:
     """Restore scheduled jobs from database after restart."""
-    # TODO: Load scheduled posts from DB and recreate jobs
     logger.info("Restoring scheduled jobs from database...")
+    
+    try:
+        from app.db.session import get_session
+        from app.db.repo import DraftPostRepository
+        from app.services.publishing import publish_scheduled_post
+        
+        async with get_session() as session:
+            repo = DraftPostRepository(session)
+            scheduled_posts = await repo.get_scheduled()
+            
+            count = 0
+            for post in scheduled_posts:
+                if post.scheduled_at and scheduler:
+                    job_id = f"publish_post_{post.id}"
+                    scheduler.add_job(
+                        publish_scheduled_post,
+                        trigger=DateTrigger(run_date=post.scheduled_at),
+                        id=job_id,
+                        args=[post.id],
+                        replace_existing=True,
+                    )
+                    count += 1
+                    logger.debug(f"Restored job for post {post.id} at {post.scheduled_at}")
+            
+            logger.info(f"Restored {count} scheduled jobs from database")
+    except Exception as e:
+        logger.error(f"Failed to restore scheduled jobs: {e}")
 
 
 async def schedule_post(

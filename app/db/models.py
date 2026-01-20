@@ -4,7 +4,7 @@ from datetime import datetime
 from enum import Enum
 from typing import List, Optional
 
-from sqlalchemy import BigInteger, DateTime, ForeignKey, String, Text, Boolean
+from sqlalchemy import BigInteger, DateTime, ForeignKey, String, Text, Boolean, JSON
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base, IDMixin, TimestampMixin
@@ -40,6 +40,9 @@ class DraftPost(Base, IDMixin, TimestampMixin):
 
     # Post content
     text: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    
+    # Text entities (for premium emoji and formatting)
+    text_entities: Mapped[Optional[List[dict]]] = mapped_column(JSON, nullable=True)
     
     # Scheduling
     scheduled_at: Mapped[Optional[datetime]] = mapped_column(

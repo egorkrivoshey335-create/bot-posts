@@ -1,7 +1,7 @@
 """Repository pattern for database operations."""
 
 from datetime import datetime
-from typing import List, Optional, Sequence
+from typing import List, Optional, Sequence, Tuple
 
 from sqlalchemy import select, update, delete
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -20,13 +20,18 @@ class DraftPostRepository:
         author_id: int,
         author_username: Optional[str] = None,
         text: Optional[str] = None,
+        text_entities: Optional[List[dict]] = None,
+        scheduled_at: Optional[datetime] = None,
+        status: PostStatus = PostStatus.DRAFT,
     ) -> DraftPost:
         """Create a new draft post."""
         post = DraftPost(
             author_id=author_id,
             author_username=author_username,
             text=text,
-            status=PostStatus.DRAFT.value,
+            text_entities=text_entities,
+            scheduled_at=scheduled_at,
+            status=status.value,
         )
         self.session.add(post)
         await self.session.flush()
@@ -226,3 +231,71 @@ class DraftButtonRepository:
             delete(DraftButton).where(DraftButton.id == button_id)
         )
         return result.rowcount > 0
+
+
+async def create_post_with_relations(
+    session: "AsyncSession",
+    author_id: int,
+    author_username: Optional[str] = None,
+    text: Optional[str] = None,
+    text_entities: Optional[List[dict]] = None,
+    media_items: Optional[List[dict]] = None,
+    buttons: Optional[List[Tuple[str, str]]] = None,
+    scheduled_at: Optional[datetime] = None,
+    status: PostStatus = PostStatus.DRAFT,
+) -> DraftPost:
+    """
+    Create a post with all related media and buttons in one transaction.
+    
+    Args:
+        session: Database session
+        author_id: Telegram user ID
+        author_username: Telegram username
+        text: Post text/caption
+        text_entities: Serialized MessageEntity objects
+        media_items: List of dicts with file_id, file_unique_id, media_type
+        buttons: List of (text, url) tuples
+        scheduled_at: Optional scheduled publication time
+        status: Post status
+        
+    Returns:
+        Created DraftPost with relations
+    """
+    # Create post
+    post_repo = DraftPostRepository(session)
+    post = await post_repo.create(
+        author_id=author_id,
+        author_username=author_username,
+        text=text,
+        text_entities=text_entities,
+        scheduled_at=scheduled_at,
+        status=status,
+    )
+    
+    # Add media
+    if media_items:
+        media_repo = DraftMediaRepository(session)
+        for i, media in enumerate(media_items):
+            await media_repo.add_media(
+                post_id=post.id,
+                file_id=media["file_id"],
+                file_unique_id=media.get("file_unique_id", media["file_id"]),
+                media_type=media["media_type"],
+                position=i,
+            )
+    
+    # Add buttons
+    if buttons:
+        button_repo = DraftButtonRepository(session)
+        for i, (btn_text, btn_url) in enumerate(buttons):
+            await button_repo.add_button(
+                post_id=post.id,
+                text=btn_text,
+                url=btn_url,
+                row=i,
+                position=0,
+            )
+    
+    # Refresh to get relations
+    await session.refresh(post)
+    return post

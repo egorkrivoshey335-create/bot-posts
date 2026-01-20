@@ -12,6 +12,7 @@ from aiogram.types import (
     InputMediaDocument,
     InputMediaAudio,
     InputMediaAnimation,
+    MessageEntity,
 )
 
 from app.bot import bot
@@ -21,6 +22,23 @@ from app.db.repo import DraftPostRepository
 from app.db.session import get_session
 
 logger = logging.getLogger(__name__)
+
+
+def list_to_entities(data: Optional[List[dict]]) -> Optional[List[MessageEntity]]:
+    """Convert serialized list back to MessageEntity objects."""
+    if not data:
+        return None
+    result = []
+    for item in data:
+        result.append(MessageEntity(
+            type=item["type"],
+            offset=item["offset"],
+            length=item["length"],
+            url=item.get("url"),
+            language=item.get("language"),
+            custom_emoji_id=item.get("custom_emoji_id"),
+        ))
+    return result
 
 
 def build_keyboard(buttons: List[DraftButton]) -> Optional[InlineKeyboardMarkup]:
@@ -45,7 +63,11 @@ def build_keyboard(buttons: List[DraftButton]) -> Optional[InlineKeyboardMarkup]
     return InlineKeyboardMarkup(inline_keyboard=keyboard)
 
 
-def get_input_media(media: DraftMedia, caption: Optional[str] = None):
+def get_input_media(
+    media: DraftMedia,
+    caption: Optional[str] = None,
+    caption_entities: Optional[List[MessageEntity]] = None,
+):
     """Convert DraftMedia to appropriate InputMedia type."""
     media_classes = {
         MediaType.PHOTO.value: InputMediaPhoto,
@@ -56,7 +78,7 @@ def get_input_media(media: DraftMedia, caption: Optional[str] = None):
     }
     
     media_class = media_classes.get(media.media_type, InputMediaPhoto)
-    return media_class(media=media.file_id, caption=caption)
+    return media_class(media=media.file_id, caption=caption, caption_entities=caption_entities)
 
 
 async def publish_post(post: DraftPost) -> Optional[int]:
@@ -73,6 +95,7 @@ async def publish_post(post: DraftPost) -> Optional[int]:
     channel_id = settings.channel_id
     
     keyboard = build_keyboard(list(post.buttons))
+    entities = list_to_entities(post.text_entities)
     
     try:
         # Case 1: No media, text only
@@ -80,6 +103,7 @@ async def publish_post(post: DraftPost) -> Optional[int]:
             message = await bot.send_message(
                 chat_id=channel_id,
                 text=post.text or "",
+                entities=entities,
                 reply_markup=keyboard,
                 disable_web_page_preview=post.disable_link_preview,
                 disable_notification=post.disable_notification,
@@ -102,6 +126,7 @@ async def publish_post(post: DraftPost) -> Optional[int]:
                 chat_id=channel_id,
                 **{media.media_type: media.file_id},
                 caption=post.text,
+                caption_entities=entities,
                 reply_markup=keyboard,
                 disable_notification=post.disable_notification,
             )
@@ -110,9 +135,10 @@ async def publish_post(post: DraftPost) -> Optional[int]:
         # Case 3: Media group (album)
         media_list = []
         for i, media in enumerate(post.media):
-            # Only first media has caption
+            # Only first media has caption and entities
             caption = post.text if i == 0 else None
-            media_list.append(get_input_media(media, caption))
+            caption_ent = entities if i == 0 else None
+            media_list.append(get_input_media(media, caption, caption_ent))
         
         messages = await bot.send_media_group(
             chat_id=channel_id,

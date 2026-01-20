@@ -1,6 +1,7 @@
 """Post creation wizard with FSM."""
 
 import logging
+from datetime import datetime, timezone
 from typing import Optional, List, Tuple
 
 from aiogram import F, Router
@@ -17,6 +18,11 @@ from aiogram.types import (
 
 from app.bot import bot
 from app.keyboards.inline import cancel_keyboard
+from app.db.models import PostStatus
+from app.db.repo import create_post_with_relations, DraftPostRepository
+from app.db.session import get_session
+from app.services.publishing import publish_post
+from app.services.scheduler import schedule_post
 
 logger = logging.getLogger(__name__)
 
@@ -634,15 +640,16 @@ async def handle_schedule_input(message: Message, state: FSMContext) -> None:
     media_count = len(data.get("media_file_ids", []))
     buttons_count = len(data.get("buttons", []))
 
+    # Choose button text based on schedule
+    publish_text = "📤 Опубликовать сейчас" if is_immediate else "📤 Запланировать"
+    
     await message.answer(
         f"📋 <b>Параметры:</b>\n"
         f"• Медиа: {media_count} файл(ов)\n"
         f"• Кнопок: {buttons_count}\n"
-        f"• Публикация: {schedule_str}\n\n"
-        "⚠️ <i>Сохранение в БД будет реализовано в следующем обновлении.</i>\n"
-        "<i>Пока пост не сохраняется.</i>",
+        f"• Публикация: {schedule_str}",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="📤 Опубликовать", callback_data="wizard_publish")],
+            [InlineKeyboardButton(text=publish_text, callback_data="wizard_publish")],
             [InlineKeyboardButton(text="💾 Сохранить черновик", callback_data="wizard_save_draft")],
             [InlineKeyboardButton(text="❌ Отмена", callback_data="wizard_cancel")],
         ]),
@@ -665,21 +672,149 @@ async def cancel_wizard(callback: CallbackQuery, state: FSMContext) -> None:
 
 @router.callback_query(StateFilter(PostWizard.confirmation), F.data == "wizard_publish")
 async def publish_immediately(callback: CallbackQuery, state: FSMContext) -> None:
-    """Publish post (placeholder)."""
-    await callback.message.edit_text(
-        "⚠️ <b>Публикация пока не реализована</b>\n\n"
-        "<i>Эта функция будет добавлена после интеграции с базой данных.</i>"
-    )
-    await callback.answer()
+    """Publish post immediately or schedule it."""
+    await callback.answer("⏳ Обрабатываю...")
+    
+    user = callback.from_user
+    data = await state.get_data()
+    
+    # Parse scheduled_at
+    scheduled_at_str = data.get("scheduled_at")
+    scheduled_at = None
+    if scheduled_at_str:
+        try:
+            scheduled_at = datetime.fromisoformat(scheduled_at_str)
+        except (ValueError, TypeError):
+            pass
+    
+    # Determine if immediate or scheduled
+    is_immediate = scheduled_at is None or scheduled_at <= datetime.now(timezone.utc)
+    
+    # Prepare media items
+    media_items = None
+    media_file_ids = data.get("media_file_ids", [])
+    media_type = data.get("media_type")
+    if media_file_ids and media_type:
+        media_items = [
+            {"file_id": fid, "file_unique_id": fid, "media_type": media_type}
+            for fid in media_file_ids
+        ]
+    
+    try:
+        async with get_session() as session:
+            # Create post in DB
+            post = await create_post_with_relations(
+                session=session,
+                author_id=user.id,
+                author_username=user.username,
+                text=data.get("text"),
+                text_entities=data.get("text_entities"),
+                media_items=media_items,
+                buttons=data.get("buttons"),
+                scheduled_at=scheduled_at if not is_immediate else None,
+                status=PostStatus.SCHEDULED if not is_immediate else PostStatus.DRAFT,
+            )
+            
+            if is_immediate:
+                # Publish now
+                message_id = await publish_post(post)
+                
+                if message_id:
+                    # Update post status
+                    repo = DraftPostRepository(session)
+                    await repo.mark_published(
+                        post_id=post.id,
+                        message_id=message_id,
+                        published_at=datetime.now(timezone.utc),
+                    )
+                    
+                    await callback.message.edit_text(
+                        "✅ <b>Пост успешно опубликован!</b>\n\n"
+                        f"📝 ID поста: <code>{post.id}</code>\n"
+                        f"📨 ID сообщения: <code>{message_id}</code>"
+                    )
+                    logger.info(f"User {user.id} published post {post.id}, message_id={message_id}")
+                else:
+                    await repo.mark_failed(post.id)
+                    await callback.message.edit_text(
+                        "❌ <b>Ошибка публикации</b>\n\n"
+                        "Не удалось отправить пост в канал. "
+                        "Проверьте, что бот является администратором канала."
+                    )
+                    logger.error(f"Failed to publish post {post.id} for user {user.id}")
+            else:
+                # Schedule for later
+                job_id = await schedule_post(post.id, scheduled_at)
+                
+                # Update job ID in DB
+                repo = DraftPostRepository(session)
+                await repo.update(post.id, scheduler_job_id=job_id)
+                
+                from app.services.datetime_parse import format_datetime
+                await callback.message.edit_text(
+                    "✅ <b>Пост запланирован!</b>\n\n"
+                    f"📝 ID поста: <code>{post.id}</code>\n"
+                    f"📅 Публикация: {format_datetime(scheduled_at)}\n\n"
+                    "💡 <i>Используйте /drafts для управления черновиками</i>"
+                )
+                logger.info(f"User {user.id} scheduled post {post.id} for {scheduled_at}")
+    
+    except Exception as e:
+        logger.exception(f"Error publishing post for user {user.id}: {e}")
+        await callback.message.edit_text(
+            "❌ <b>Произошла ошибка</b>\n\n"
+            f"<code>{str(e)}</code>\n\n"
+            "Попробуйте ещё раз или обратитесь к администратору."
+        )
+    
     await state.clear()
 
 
 @router.callback_query(StateFilter(PostWizard.confirmation), F.data == "wizard_save_draft")
 async def save_as_draft(callback: CallbackQuery, state: FSMContext) -> None:
-    """Save as draft (placeholder)."""
-    await callback.message.edit_text(
-        "⚠️ <b>Сохранение черновика пока не реализовано</b>\n\n"
-        "<i>Эта функция будет добавлена после интеграции с базой данных.</i>"
-    )
-    await callback.answer()
+    """Save post as draft without publishing."""
+    await callback.answer("⏳ Сохраняю...")
+    
+    user = callback.from_user
+    data = await state.get_data()
+    
+    # Prepare media items
+    media_items = None
+    media_file_ids = data.get("media_file_ids", [])
+    media_type = data.get("media_type")
+    if media_file_ids and media_type:
+        media_items = [
+            {"file_id": fid, "file_unique_id": fid, "media_type": media_type}
+            for fid in media_file_ids
+        ]
+    
+    try:
+        async with get_session() as session:
+            # Create draft post in DB
+            post = await create_post_with_relations(
+                session=session,
+                author_id=user.id,
+                author_username=user.username,
+                text=data.get("text"),
+                text_entities=data.get("text_entities"),
+                media_items=media_items,
+                buttons=data.get("buttons"),
+                status=PostStatus.DRAFT,
+            )
+            
+            await callback.message.edit_text(
+                "✅ <b>Черновик сохранён!</b>\n\n"
+                f"📝 ID поста: <code>{post.id}</code>\n\n"
+                "💡 <i>Используйте /drafts для управления черновиками</i>"
+            )
+            logger.info(f"User {user.id} saved draft {post.id}")
+    
+    except Exception as e:
+        logger.exception(f"Error saving draft for user {user.id}: {e}")
+        await callback.message.edit_text(
+            "❌ <b>Произошла ошибка при сохранении</b>\n\n"
+            f"<code>{str(e)}</code>\n\n"
+            "Попробуйте ещё раз или обратитесь к администратору."
+        )
+    
     await state.clear()
