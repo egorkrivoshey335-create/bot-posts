@@ -33,7 +33,7 @@ def upgrade() -> None:
         sa.Column('disable_link_preview', sa.Boolean(), nullable=False, default=True),
         sa.Column('disable_notification', sa.Boolean(), nullable=False, default=False),
         sa.Column('created_at', sa.DateTime(timezone=True), server_default=sa.text('now()'), nullable=False),
-        sa.Column('updated_at', sa.DateTime(timezone=True), server_default=sa.text('now()'), onupdate=sa.text('now()'), nullable=False),
+        sa.Column('updated_at', sa.DateTime(timezone=True), server_default=sa.text('now()'), nullable=False),
         sa.PrimaryKeyConstraint('id')
     )
     op.create_index('ix_draft_posts_author_id', 'draft_posts', ['author_id'])

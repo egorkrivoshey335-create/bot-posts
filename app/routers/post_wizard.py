@@ -761,9 +761,11 @@ async def publish_immediately(callback: CallbackQuery, state: FSMContext) -> Non
     
     except Exception as e:
         logger.exception(f"Error publishing post for user {user.id}: {e}")
+        from html import escape
+        error_text = escape(str(e)[:200])  # Limit and escape error text
         await callback.message.edit_text(
             "❌ <b>Произошла ошибка</b>\n\n"
-            f"<code>{str(e)}</code>\n\n"
+            f"<code>{error_text}</code>\n\n"
             "Попробуйте ещё раз или обратитесь к администратору."
         )
     
@@ -811,9 +813,11 @@ async def save_as_draft(callback: CallbackQuery, state: FSMContext) -> None:
     
     except Exception as e:
         logger.exception(f"Error saving draft for user {user.id}: {e}")
+        from html import escape
+        error_text = escape(str(e)[:200])
         await callback.message.edit_text(
             "❌ <b>Произошла ошибка при сохранении</b>\n\n"
-            f"<code>{str(e)}</code>\n\n"
+            f"<code>{error_text}</code>\n\n"
             "Попробуйте ещё раз или обратитесь к администратору."
         )
     
