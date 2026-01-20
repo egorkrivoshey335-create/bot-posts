@@ -7,7 +7,13 @@ from aiogram import F, Router
 from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import (
+    Message,
+    CallbackQuery,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+    MessageEntity,
+)
 
 from app.bot import bot
 from app.keyboards.inline import cancel_keyboard
@@ -56,14 +62,50 @@ def wizard_keyboard(
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
+def entities_to_list(entities: Optional[tuple]) -> Optional[List[dict]]:
+    """Convert MessageEntity tuple to serializable list for FSM storage."""
+    if not entities:
+        return None
+    result = []
+    for entity in entities:
+        result.append({
+            "type": entity.type,
+            "offset": entity.offset,
+            "length": entity.length,
+            "url": entity.url,
+            "user": entity.user.model_dump() if entity.user else None,
+            "language": entity.language,
+            "custom_emoji_id": entity.custom_emoji_id,
+        })
+    return result
+
+
+def list_to_entities(data: Optional[List[dict]]) -> Optional[List[MessageEntity]]:
+    """Convert serialized list back to MessageEntity objects."""
+    if not data:
+        return None
+    result = []
+    for item in data:
+        result.append(MessageEntity(
+            type=item["type"],
+            offset=item["offset"],
+            length=item["length"],
+            url=item.get("url"),
+            language=item.get("language"),
+            custom_emoji_id=item.get("custom_emoji_id"),
+        ))
+    return result
+
+
 async def send_post_preview(
     chat_id: int,
     text: Optional[str],
+    text_entities: Optional[List[dict]],
     media_file_ids: List[str],
     media_type: Optional[str],
     buttons: List[Tuple[str, str]],
 ) -> Optional[Message]:
-    """Send actual post preview to user."""
+    """Send actual post preview to user with preserved entities (custom emoji)."""
     # Build inline keyboard from buttons
     keyboard = None
     if buttons:
@@ -72,6 +114,9 @@ async def send_post_preview(
             kb_rows.append([InlineKeyboardButton(text=btn_text, url=btn_url)])
         keyboard = InlineKeyboardMarkup(inline_keyboard=kb_rows)
 
+    # Convert entities from stored format
+    entities = list_to_entities(text_entities)
+
     try:
         # No media - text only
         if not media_file_ids:
@@ -79,6 +124,7 @@ async def send_post_preview(
                 return await bot.send_message(
                     chat_id=chat_id,
                     text=text,
+                    entities=entities,
                     reply_markup=keyboard,
                 )
             return None
@@ -86,27 +132,48 @@ async def send_post_preview(
         # Single media
         if len(media_file_ids) == 1:
             file_id = media_file_ids[0]
-            send_methods = {
-                "photo": bot.send_photo,
-                "video": bot.send_video,
-                "document": bot.send_document,
-                "audio": bot.send_audio,
-                "animation": bot.send_animation,
-            }
-
-            send_method = send_methods.get(media_type, bot.send_photo)
 
             # For methods that use specific parameter name
             if media_type == "photo":
-                return await send_method(chat_id=chat_id, photo=file_id, caption=text, reply_markup=keyboard)
+                return await bot.send_photo(
+                    chat_id=chat_id,
+                    photo=file_id,
+                    caption=text,
+                    caption_entities=entities,
+                    reply_markup=keyboard,
+                )
             elif media_type == "video":
-                return await send_method(chat_id=chat_id, video=file_id, caption=text, reply_markup=keyboard)
+                return await bot.send_video(
+                    chat_id=chat_id,
+                    video=file_id,
+                    caption=text,
+                    caption_entities=entities,
+                    reply_markup=keyboard,
+                )
             elif media_type == "document":
-                return await send_method(chat_id=chat_id, document=file_id, caption=text, reply_markup=keyboard)
+                return await bot.send_document(
+                    chat_id=chat_id,
+                    document=file_id,
+                    caption=text,
+                    caption_entities=entities,
+                    reply_markup=keyboard,
+                )
             elif media_type == "animation":
-                return await send_method(chat_id=chat_id, animation=file_id, caption=text, reply_markup=keyboard)
+                return await bot.send_animation(
+                    chat_id=chat_id,
+                    animation=file_id,
+                    caption=text,
+                    caption_entities=entities,
+                    reply_markup=keyboard,
+                )
             else:
-                return await bot.send_photo(chat_id=chat_id, photo=file_id, caption=text, reply_markup=keyboard)
+                return await bot.send_photo(
+                    chat_id=chat_id,
+                    photo=file_id,
+                    caption=text,
+                    caption_entities=entities,
+                    reply_markup=keyboard,
+                )
 
         # Multiple media - media group (buttons sent separately)
         from aiogram.types import InputMediaPhoto, InputMediaVideo
@@ -114,10 +181,19 @@ async def send_post_preview(
         media_list = []
         for i, file_id in enumerate(media_file_ids):
             caption = text if i == 0 else None
+            caption_ent = entities if i == 0 else None
             if media_type == "video":
-                media_list.append(InputMediaVideo(media=file_id, caption=caption))
+                media_list.append(InputMediaVideo(
+                    media=file_id,
+                    caption=caption,
+                    caption_entities=caption_ent,
+                ))
             else:
-                media_list.append(InputMediaPhoto(media=file_id, caption=caption))
+                media_list.append(InputMediaPhoto(
+                    media=file_id,
+                    caption=caption,
+                    caption_entities=caption_ent,
+                ))
 
         messages = await bot.send_media_group(chat_id=chat_id, media=media_list)
 
@@ -158,7 +234,8 @@ async def cmd_new_post(message: Message, state: FSMContext) -> None:
         "• <b>Текст</b> — просто напишите сообщение\n"
         "• <b>Фото/Видео</b> — отправьте медиафайл\n"
         "• <b>Фото + текст</b> — добавьте подпись к медиа\n\n"
-        "💡 <i>Подпись (caption) к фото/видео станет текстом поста</i>",
+        "💡 <i>Подпись (caption) к фото/видео станет текстом поста</i>\n"
+        "💡 <i>Premium emoji в тексте сохраняются</i>",
         reply_markup=cancel_keyboard(),
     )
 
@@ -171,11 +248,13 @@ async def cmd_new_post(message: Message, state: FSMContext) -> None:
 async def handle_text_content(message: Message, state: FSMContext) -> None:
     """Handle plain text message."""
     text = message.text
+    entities = entities_to_list(message.entities)
     user_id = message.from_user.id if message.from_user else "unknown"
-    logger.info(f"[content] User {user_id} sent text: {repr(text)[:50]}")
+    logger.info(f"[content] User {user_id} sent text: {repr(text)[:50]}, entities: {len(message.entities or [])}")
 
     await state.update_data(
         text=text,
+        text_entities=entities,
         media_type=None,
         media_file_ids=[],
         buttons=[],
@@ -186,6 +265,7 @@ async def handle_text_content(message: Message, state: FSMContext) -> None:
     await send_post_preview(
         chat_id=message.chat.id,
         text=text,
+        text_entities=entities,
         media_file_ids=[],
         media_type=None,
         buttons=[],
@@ -199,12 +279,14 @@ async def handle_photo_content(message: Message, state: FSMContext) -> None:
     """Handle photo message."""
     user_id = message.from_user.id if message.from_user else "unknown"
     caption = message.caption or ""
+    caption_entities = entities_to_list(message.caption_entities)
     photo = message.photo[-1]
 
-    logger.info(f"[content] User {user_id} sent photo with caption: {repr(caption)[:50]}")
+    logger.info(f"[content] User {user_id} sent photo with caption: {repr(caption)[:50]}, entities: {len(message.caption_entities or [])}")
 
     await state.update_data(
         text=caption,
+        text_entities=caption_entities,
         media_type="photo",
         media_file_ids=[photo.file_id],
         buttons=[],
@@ -215,6 +297,7 @@ async def handle_photo_content(message: Message, state: FSMContext) -> None:
     await send_post_preview(
         chat_id=message.chat.id,
         text=caption,
+        text_entities=caption_entities,
         media_file_ids=[photo.file_id],
         media_type="photo",
         buttons=[],
@@ -227,10 +310,12 @@ async def handle_photo_content(message: Message, state: FSMContext) -> None:
 async def handle_video_content(message: Message, state: FSMContext) -> None:
     """Handle video message."""
     caption = message.caption or ""
+    caption_entities = entities_to_list(message.caption_entities)
     video = message.video
 
     await state.update_data(
         text=caption,
+        text_entities=caption_entities,
         media_type="video",
         media_file_ids=[video.file_id],
         buttons=[],
@@ -240,6 +325,7 @@ async def handle_video_content(message: Message, state: FSMContext) -> None:
     await send_post_preview(
         chat_id=message.chat.id,
         text=caption,
+        text_entities=caption_entities,
         media_file_ids=[video.file_id],
         media_type="video",
         buttons=[],
@@ -252,10 +338,12 @@ async def handle_video_content(message: Message, state: FSMContext) -> None:
 async def handle_document_content(message: Message, state: FSMContext) -> None:
     """Handle document message."""
     caption = message.caption or ""
+    caption_entities = entities_to_list(message.caption_entities)
     document = message.document
 
     await state.update_data(
         text=caption,
+        text_entities=caption_entities,
         media_type="document",
         media_file_ids=[document.file_id],
         buttons=[],
@@ -265,6 +353,7 @@ async def handle_document_content(message: Message, state: FSMContext) -> None:
     await send_post_preview(
         chat_id=message.chat.id,
         text=caption,
+        text_entities=caption_entities,
         media_file_ids=[document.file_id],
         media_type="document",
         buttons=[],
@@ -278,10 +367,12 @@ async def handle_document_content(message: Message, state: FSMContext) -> None:
 async def handle_animation_content(message: Message, state: FSMContext) -> None:
     """Handle animation (GIF) message."""
     caption = message.caption or ""
+    caption_entities = entities_to_list(message.caption_entities)
     animation = message.animation
 
     await state.update_data(
         text=caption,
+        text_entities=caption_entities,
         media_type="animation",
         media_file_ids=[animation.file_id],
         buttons=[],
@@ -291,6 +382,7 @@ async def handle_animation_content(message: Message, state: FSMContext) -> None:
     await send_post_preview(
         chat_id=message.chat.id,
         text=caption,
+        text_entities=caption_entities,
         media_file_ids=[animation.file_id],
         media_type="animation",
         buttons=[],
@@ -357,6 +449,7 @@ async def handle_additional_photo(message: Message, state: FSMContext) -> None:
     await send_post_preview(
         chat_id=message.chat.id,
         text=data.get("text", ""),
+        text_entities=data.get("text_entities"),
         media_file_ids=media_file_ids,
         media_type="photo",
         buttons=[],
@@ -441,6 +534,7 @@ async def handle_buttons_input(message: Message, state: FSMContext) -> None:
     await send_post_preview(
         chat_id=message.chat.id,
         text=data.get("text", ""),
+        text_entities=data.get("text_entities"),
         media_file_ids=data.get("media_file_ids", []),
         media_type=data.get("media_type"),
         buttons=buttons,
@@ -531,6 +625,7 @@ async def handle_schedule_input(message: Message, state: FSMContext) -> None:
     await send_post_preview(
         chat_id=message.chat.id,
         text=data.get("text", ""),
+        text_entities=data.get("text_entities"),
         media_file_ids=data.get("media_file_ids", []),
         media_type=data.get("media_type"),
         buttons=data.get("buttons", []),
