@@ -1,11 +1,11 @@
 """Date/time parser for scheduling posts."""
 
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone as dt_timezone
 from typing import Optional, Tuple
+from zoneinfo import ZoneInfo
 
 from dateutil import parser as dateutil_parser
-from dateutil.relativedelta import relativedelta
 
 from app.config import get_settings
 
@@ -19,14 +19,13 @@ RUSSIAN_DAYS = {
 }
 
 
-def get_timezone():
-    """Get timezone from settings."""
-    import pytz
+def get_timezone() -> ZoneInfo:
+    """Get timezone from settings using built-in zoneinfo."""
     settings = get_settings()
     try:
-        return pytz.timezone(settings.tz)
+        return ZoneInfo(settings.tz)
     except Exception:
-        return pytz.UTC
+        return ZoneInfo("UTC")
 
 
 def parse_datetime(text: str) -> Tuple[Optional[datetime], Optional[str]]:
@@ -49,13 +48,14 @@ def parse_datetime(text: str) -> Tuple[Optional[datetime], Optional[str]]:
         Tuple of (parsed datetime or None, error message or None)
     """
     text = text.strip().lower()
+    tz = get_timezone()
     
     # Immediate publication
     if text in ("now", "сейчас", "немедленно"):
-        return datetime.now(get_timezone()), None
+        return datetime.now(tz), None
     
     try:
-        now = datetime.now(get_timezone())
+        now = datetime.now(tz)
         
         # Check for Russian day prefixes
         target_date = now.date()
@@ -71,11 +71,14 @@ def parse_datetime(text: str) -> Tuple[Optional[datetime], Optional[str]]:
         if ":" in time_part and len(time_part.split()) == 1:
             try:
                 hours, minutes = map(int, time_part.split(":"))
-                result = datetime.combine(
-                    target_date,
-                    datetime.min.time().replace(hour=hours, minute=minutes)
+                result = datetime(
+                    target_date.year,
+                    target_date.month,
+                    target_date.day,
+                    hours,
+                    minutes,
+                    tzinfo=tz,
                 )
-                result = get_timezone().localize(result)
                 
                 # If time has passed today, schedule for tomorrow
                 if result <= now and target_date == now.date():
@@ -100,15 +103,14 @@ def parse_datetime(text: str) -> Tuple[Optional[datetime], Optional[str]]:
                 # Parse time
                 hours, minutes = map(int, time_str.split(":"))
                 
-                result = datetime(year, month, day, hours, minutes)
-                result = get_timezone().localize(result)
+                result = datetime(year, month, day, hours, minutes, tzinfo=tz)
                 
                 return result, None
         
         # Fallback to dateutil parser
         parsed = dateutil_parser.parse(text, dayfirst=True)
         if parsed.tzinfo is None:
-            parsed = get_timezone().localize(parsed)
+            parsed = parsed.replace(tzinfo=tz)
         return parsed, None
         
     except Exception as e:
@@ -125,7 +127,12 @@ def parse_datetime(text: str) -> Tuple[Optional[datetime], Optional[str]]:
 
 def format_datetime(dt: datetime) -> str:
     """Format datetime for display in Russian."""
-    now = datetime.now(get_timezone())
+    tz = get_timezone()
+    now = datetime.now(tz)
+    
+    # Ensure dt has timezone
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=tz)
     
     if dt.date() == now.date():
         return f"сегодня в {dt.strftime('%H:%M')}"
