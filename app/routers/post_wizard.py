@@ -1,16 +1,16 @@
 """Post creation wizard with FSM."""
 
 import logging
-from dataclasses import dataclass
-from typing import Optional, List
+from typing import Optional, List, Tuple
 
 from aiogram import F, Router
 from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import Message, CallbackQuery
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 
-from app.keyboards.inline import skip_keyboard, done_keyboard, cancel_keyboard
+from app.bot import bot
+from app.keyboards.inline import cancel_keyboard
 
 logger = logging.getLogger(__name__)
 
@@ -20,23 +20,120 @@ router = Router(name="post_wizard")
 class PostWizard(StatesGroup):
     """States for post creation wizard."""
 
-    waiting_for_text = State()
-    waiting_for_media = State()
-    waiting_for_buttons = State()
-    waiting_for_schedule = State()
+    waiting_for_content = State()  # Text or media with caption
+    waiting_for_more_media = State()  # Additional media for album
+    waiting_for_buttons = State()  # Inline buttons
+    waiting_for_schedule = State()  # Publication time
     confirmation = State()
 
 
-@dataclass
-class PostData:
-    """Temporary storage for post data during wizard."""
-    text: Optional[str] = None
-    media_file_ids: List[str] = None
-    media_type: Optional[str] = None
+# =============================================================================
+# Helper functions
+# =============================================================================
 
-    def __post_init__(self):
-        if self.media_file_ids is None:
-            self.media_file_ids = []
+def wizard_keyboard(
+    next_step: str = None,
+    show_skip: bool = False,
+    show_done: bool = False,
+    show_preview: bool = False,
+) -> InlineKeyboardMarkup:
+    """Build wizard navigation keyboard."""
+    buttons = []
+
+    if show_preview:
+        buttons.append([InlineKeyboardButton(text="👁 Превью", callback_data="wizard_preview")])
+
+    row = []
+    if show_skip:
+        row.append(InlineKeyboardButton(text="⏭ Пропустить", callback_data=f"wizard_skip_{next_step}"))
+    if show_done:
+        row.append(InlineKeyboardButton(text="✅ Готово", callback_data=f"wizard_done_{next_step}"))
+    if row:
+        buttons.append(row)
+
+    buttons.append([InlineKeyboardButton(text="❌ Отмена", callback_data="wizard_cancel")])
+
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+async def send_post_preview(
+    chat_id: int,
+    text: Optional[str],
+    media_file_ids: List[str],
+    media_type: Optional[str],
+    buttons: List[Tuple[str, str]],
+) -> Optional[Message]:
+    """Send actual post preview to user."""
+    # Build inline keyboard from buttons
+    keyboard = None
+    if buttons:
+        kb_rows = []
+        for btn_text, btn_url in buttons:
+            kb_rows.append([InlineKeyboardButton(text=btn_text, url=btn_url)])
+        keyboard = InlineKeyboardMarkup(inline_keyboard=kb_rows)
+
+    try:
+        # No media - text only
+        if not media_file_ids:
+            if text:
+                return await bot.send_message(
+                    chat_id=chat_id,
+                    text=text,
+                    reply_markup=keyboard,
+                )
+            return None
+
+        # Single media
+        if len(media_file_ids) == 1:
+            file_id = media_file_ids[0]
+            send_methods = {
+                "photo": bot.send_photo,
+                "video": bot.send_video,
+                "document": bot.send_document,
+                "audio": bot.send_audio,
+                "animation": bot.send_animation,
+            }
+
+            send_method = send_methods.get(media_type, bot.send_photo)
+
+            # For methods that use specific parameter name
+            if media_type == "photo":
+                return await send_method(chat_id=chat_id, photo=file_id, caption=text, reply_markup=keyboard)
+            elif media_type == "video":
+                return await send_method(chat_id=chat_id, video=file_id, caption=text, reply_markup=keyboard)
+            elif media_type == "document":
+                return await send_method(chat_id=chat_id, document=file_id, caption=text, reply_markup=keyboard)
+            elif media_type == "animation":
+                return await send_method(chat_id=chat_id, animation=file_id, caption=text, reply_markup=keyboard)
+            else:
+                return await bot.send_photo(chat_id=chat_id, photo=file_id, caption=text, reply_markup=keyboard)
+
+        # Multiple media - media group (buttons sent separately)
+        from aiogram.types import InputMediaPhoto, InputMediaVideo
+
+        media_list = []
+        for i, file_id in enumerate(media_file_ids):
+            caption = text if i == 0 else None
+            if media_type == "video":
+                media_list.append(InputMediaVideo(media=file_id, caption=caption))
+            else:
+                media_list.append(InputMediaPhoto(media=file_id, caption=caption))
+
+        messages = await bot.send_media_group(chat_id=chat_id, media=media_list)
+
+        # Send buttons separately
+        if keyboard:
+            await bot.send_message(
+                chat_id=chat_id,
+                text="👆 <i>Кнопки будут прикреплены к посту</i>",
+                reply_markup=keyboard,
+            )
+
+        return messages[0] if messages else None
+
+    except Exception as e:
+        logger.error(f"Failed to send preview: {e}")
+        return None
 
 
 # =============================================================================
@@ -49,182 +146,203 @@ async def cmd_new_post(message: Message, state: FSMContext) -> None:
     user_id = message.from_user.id if message.from_user else "unknown"
     logger.info(f"User {user_id} started new post creation")
 
-    # Clear any previous state data
     await state.clear()
-
-    # Set state to waiting for text
-    await state.set_state(PostWizard.waiting_for_text)
-
-    # Confirm state was set
-    current_state = await state.get_state()
-    logger.info(f"State set to: {current_state}")
+    await state.set_state(PostWizard.waiting_for_content)
 
     await message.answer(
         "📝 <b>Создание нового поста</b>\n\n"
-        "Отправьте текст поста или медиафайл (фото/видео/документ).\n"
-        "Медиа можно отправить с подписью (caption).\n\n"
-        "Для отмены используйте /cancel"
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        "📌 <b>Шаг 1 из 4: Контент</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        "Отправьте контент для поста:\n\n"
+        "• <b>Текст</b> — просто напишите сообщение\n"
+        "• <b>Фото/Видео</b> — отправьте медиафайл\n"
+        "• <b>Фото + текст</b> — добавьте подпись к медиа\n\n"
+        "💡 <i>Подпись (caption) к фото/видео станет текстом поста</i>",
+        reply_markup=cancel_keyboard(),
     )
 
 
 # =============================================================================
-# waiting_for_text state handlers
+# Step 1: Content (text / media with caption)
 # =============================================================================
 
-@router.message(StateFilter(PostWizard.waiting_for_text), F.text)
+@router.message(StateFilter(PostWizard.waiting_for_content), F.text)
 async def handle_text_content(message: Message, state: FSMContext) -> None:
-    """Handle plain text message in waiting_for_text state."""
+    """Handle plain text message."""
     text = message.text
     user_id = message.from_user.id if message.from_user else "unknown"
+    logger.info(f"[content] User {user_id} sent text: {repr(text)[:50]}")
 
-    logger.info(f"[waiting_for_text] User {user_id} sent TEXT: {repr(text)[:100]}")
-
-    # Save text to state
-    await state.update_data(text=text, media_type=None, media_file_ids=[])
-
-    await message.answer(
-        "✅ <b>Текст поста сохранён!</b>\n\n"
-        f"<blockquote>{text[:200]}{'...' if len(text) > 200 else ''}</blockquote>\n\n"
-        "Теперь отправьте медиафайлы (фото/видео) или нажмите «Пропустить».",
-        reply_markup=skip_keyboard("skip_media"),
+    await state.update_data(
+        text=text,
+        media_type=None,
+        media_file_ids=[],
+        buttons=[],
     )
 
-    await state.set_state(PostWizard.waiting_for_media)
-    logger.info(f"State changed to: {await state.get_state()}")
+    # Show preview
+    await message.answer("👁 <b>Превью поста:</b>")
+    await send_post_preview(
+        chat_id=message.chat.id,
+        text=text,
+        media_file_ids=[],
+        media_type=None,
+        buttons=[],
+    )
+
+    await _ask_for_buttons(message, state)
 
 
-@router.message(StateFilter(PostWizard.waiting_for_text), F.photo)
+@router.message(StateFilter(PostWizard.waiting_for_content), F.photo)
 async def handle_photo_content(message: Message, state: FSMContext) -> None:
-    """Handle photo message in waiting_for_text state."""
+    """Handle photo message."""
     user_id = message.from_user.id if message.from_user else "unknown"
     caption = message.caption or ""
-    photo = message.photo[-1]  # Get highest resolution
+    photo = message.photo[-1]
 
-    logger.info(
-        f"[waiting_for_text] User {user_id} sent PHOTO | "
-        f"file_id={photo.file_id[:20]}... | caption={repr(caption)[:50]}"
-    )
+    logger.info(f"[content] User {user_id} sent photo with caption: {repr(caption)[:50]}")
 
-    # Save to state
     await state.update_data(
         text=caption,
         media_type="photo",
         media_file_ids=[photo.file_id],
+        buttons=[],
     )
 
-    caption_info = f"\n<blockquote>{caption[:200]}</blockquote>" if caption else "\n<i>(без подписи)</i>"
-
-    await message.answer(
-        f"✅ <b>Фото получено!</b>{caption_info}\n\n"
-        "Отправьте ещё медиафайлы для альбома или нажмите «Готово».",
-        reply_markup=done_keyboard("done_media"),
+    # Show preview
+    await message.answer("👁 <b>Превью поста:</b>")
+    await send_post_preview(
+        chat_id=message.chat.id,
+        text=caption,
+        media_file_ids=[photo.file_id],
+        media_type="photo",
+        buttons=[],
     )
 
-    await state.set_state(PostWizard.waiting_for_media)
-    logger.info(f"State changed to: {await state.get_state()}")
+    await _ask_for_more_media(message, state)
 
 
-@router.message(StateFilter(PostWizard.waiting_for_text), F.video)
+@router.message(StateFilter(PostWizard.waiting_for_content), F.video)
 async def handle_video_content(message: Message, state: FSMContext) -> None:
-    """Handle video message in waiting_for_text state."""
-    user_id = message.from_user.id if message.from_user else "unknown"
+    """Handle video message."""
     caption = message.caption or ""
     video = message.video
 
-    logger.info(
-        f"[waiting_for_text] User {user_id} sent VIDEO | "
-        f"file_id={video.file_id[:20]}... | caption={repr(caption)[:50]}"
-    )
-
-    # Save to state
     await state.update_data(
         text=caption,
         media_type="video",
         media_file_ids=[video.file_id],
+        buttons=[],
     )
 
-    caption_info = f"\n<blockquote>{caption[:200]}</blockquote>" if caption else "\n<i>(без подписи)</i>"
-
-    await message.answer(
-        f"✅ <b>Видео получено!</b>{caption_info}\n\n"
-        "Отправьте ещё медиафайлы для альбома или нажмите «Готово».",
-        reply_markup=done_keyboard("done_media"),
+    await message.answer("👁 <b>Превью поста:</b>")
+    await send_post_preview(
+        chat_id=message.chat.id,
+        text=caption,
+        media_file_ids=[video.file_id],
+        media_type="video",
+        buttons=[],
     )
 
-    await state.set_state(PostWizard.waiting_for_media)
-    logger.info(f"State changed to: {await state.get_state()}")
+    await _ask_for_more_media(message, state)
 
 
-@router.message(StateFilter(PostWizard.waiting_for_text), F.document)
+@router.message(StateFilter(PostWizard.waiting_for_content), F.document)
 async def handle_document_content(message: Message, state: FSMContext) -> None:
-    """Handle document message in waiting_for_text state."""
-    user_id = message.from_user.id if message.from_user else "unknown"
+    """Handle document message."""
     caption = message.caption or ""
     document = message.document
 
-    logger.info(
-        f"[waiting_for_text] User {user_id} sent DOCUMENT | "
-        f"file_id={document.file_id[:20]}... | "
-        f"file_name={document.file_name} | caption={repr(caption)[:50]}"
-    )
-
-    # Save to state
     await state.update_data(
         text=caption,
         media_type="document",
         media_file_ids=[document.file_id],
+        buttons=[],
     )
 
-    caption_info = f"\n<blockquote>{caption[:200]}</blockquote>" if caption else "\n<i>(без подписи)</i>"
-
-    await message.answer(
-        f"✅ <b>Документ получен!</b>\n"
-        f"📎 {document.file_name or 'файл'}{caption_info}\n\n"
-        "Отправьте ещё медиафайлы или нажмите «Готово».",
-        reply_markup=done_keyboard("done_media"),
+    await message.answer("👁 <b>Превью поста:</b>")
+    await send_post_preview(
+        chat_id=message.chat.id,
+        text=caption,
+        media_file_ids=[document.file_id],
+        media_type="document",
+        buttons=[],
     )
 
-    await state.set_state(PostWizard.waiting_for_media)
-    logger.info(f"State changed to: {await state.get_state()}")
+    # Documents don't support albums, go to buttons
+    await _ask_for_buttons(message, state)
 
 
-@router.message(StateFilter(PostWizard.waiting_for_text), F.animation)
+@router.message(StateFilter(PostWizard.waiting_for_content), F.animation)
 async def handle_animation_content(message: Message, state: FSMContext) -> None:
-    """Handle animation (GIF) message in waiting_for_text state."""
-    user_id = message.from_user.id if message.from_user else "unknown"
+    """Handle animation (GIF) message."""
     caption = message.caption or ""
     animation = message.animation
-
-    logger.info(
-        f"[waiting_for_text] User {user_id} sent ANIMATION | "
-        f"file_id={animation.file_id[:20]}... | caption={repr(caption)[:50]}"
-    )
 
     await state.update_data(
         text=caption,
         media_type="animation",
         media_file_ids=[animation.file_id],
+        buttons=[],
     )
 
-    caption_info = f"\n<blockquote>{caption[:200]}</blockquote>" if caption else "\n<i>(без подписи)</i>"
+    await message.answer("👁 <b>Превью поста:</b>")
+    await send_post_preview(
+        chat_id=message.chat.id,
+        text=caption,
+        media_file_ids=[animation.file_id],
+        media_type="animation",
+        buttons=[],
+    )
+
+    # Animations don't support albums, go to buttons
+    await _ask_for_buttons(message, state)
+
+
+async def _ask_for_more_media(message: Message, state: FSMContext) -> None:
+    """Ask user for additional media."""
+    await state.set_state(PostWizard.waiting_for_more_media)
 
     await message.answer(
-        f"✅ <b>GIF получен!</b>{caption_info}\n\n"
-        "Нажмите «Готово» для продолжения.",
-        reply_markup=done_keyboard("done_media"),
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        "📌 <b>Шаг 2 из 4: Альбом</b> (опционально)\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        "Хотите добавить ещё фото/видео в альбом?\n\n"
+        "• Отправьте ещё медиафайлы\n"
+        "• Или нажмите <b>«Готово»</b> чтобы продолжить\n\n"
+        "💡 <i>В альбоме может быть до 10 медиафайлов</i>",
+        reply_markup=wizard_keyboard(next_step="media", show_done=True),
     )
 
-    await state.set_state(PostWizard.waiting_for_media)
-    logger.info(f"State changed to: {await state.get_state()}")
+
+async def _ask_for_buttons(message: Message, state: FSMContext) -> None:
+    """Ask user for inline buttons."""
+    await state.set_state(PostWizard.waiting_for_buttons)
+
+    await message.answer(
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        "📌 <b>Шаг 3 из 4: Кнопки</b> (опционально)\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        "Добавьте инлайн-кнопки со ссылками.\n\n"
+        "<b>Формат:</b>\n"
+        "<code>Текст кнопки - https://example.com</code>\n\n"
+        "<b>Пример:</b>\n"
+        "<code>Наш сайт - https://mysite.com</code>\n"
+        "<code>Telegram - https://t.me/channel</code>\n\n"
+        "💡 <i>Каждая кнопка на новой строке</i>\n"
+        "💡 <i>Можно отправить несколько кнопок одним сообщением</i>",
+        reply_markup=wizard_keyboard(next_step="buttons", show_skip=True),
+    )
 
 
 # =============================================================================
-# waiting_for_media state handlers
+# Step 2: Additional media (album)
 # =============================================================================
 
-@router.message(StateFilter(PostWizard.waiting_for_media), F.photo)
+@router.message(StateFilter(PostWizard.waiting_for_more_media), F.photo)
 async def handle_additional_photo(message: Message, state: FSMContext) -> None:
-    """Handle additional photo in waiting_for_media state."""
+    """Handle additional photo for album."""
     photo = message.photo[-1]
     data = await state.get_data()
 
@@ -232,134 +350,147 @@ async def handle_additional_photo(message: Message, state: FSMContext) -> None:
     media_file_ids.append(photo.file_id)
 
     await state.update_data(media_file_ids=media_file_ids)
+    logger.info(f"[more_media] Added photo, total: {len(media_file_ids)}")
 
-    logger.info(f"[waiting_for_media] Added photo, total media: {len(media_file_ids)}")
-
-    await message.answer(
-        f"📎 Добавлено фото (всего: {len(media_file_ids)})\n"
-        "Отправьте ещё или нажмите «Готово».",
-        reply_markup=done_keyboard("done_media"),
+    # Show updated preview
+    await message.answer(f"✅ Добавлено фото #{len(media_file_ids)}\n\n👁 <b>Превью альбома:</b>")
+    await send_post_preview(
+        chat_id=message.chat.id,
+        text=data.get("text", ""),
+        media_file_ids=media_file_ids,
+        media_type="photo",
+        buttons=[],
     )
 
+    if len(media_file_ids) >= 10:
+        await message.answer("📎 Достигнут лимит в 10 медиафайлов.")
+        await _ask_for_buttons(message, state)
+    else:
+        await message.answer(
+            f"📎 Всего в альбоме: {len(media_file_ids)} файл(ов)\n"
+            "Отправьте ещё или нажмите «Готово».",
+            reply_markup=wizard_keyboard(next_step="media", show_done=True),
+        )
 
-@router.message(StateFilter(PostWizard.waiting_for_media), F.video)
+
+@router.message(StateFilter(PostWizard.waiting_for_more_media), F.video)
 async def handle_additional_video(message: Message, state: FSMContext) -> None:
-    """Handle additional video in waiting_for_media state."""
+    """Handle additional video for album."""
     video = message.video
     data = await state.get_data()
 
     media_file_ids = data.get("media_file_ids", [])
     media_file_ids.append(video.file_id)
 
-    await state.update_data(media_file_ids=media_file_ids)
+    await state.update_data(media_file_ids=media_file_ids, media_type="video")
+    logger.info(f"[more_media] Added video, total: {len(media_file_ids)}")
 
-    logger.info(f"[waiting_for_media] Added video, total media: {len(media_file_ids)}")
+    await message.answer(f"✅ Добавлено видео #{len(media_file_ids)}")
 
-    await message.answer(
-        f"📎 Добавлено видео (всего: {len(media_file_ids)})\n"
-        "Отправьте ещё или нажмите «Готово».",
-        reply_markup=done_keyboard("done_media"),
-    )
-
-
-@router.callback_query(StateFilter(PostWizard.waiting_for_media), F.data == "skip_media")
-async def skip_media_step(callback: CallbackQuery, state: FSMContext) -> None:
-    """Skip media step."""
-    logger.info(f"[waiting_for_media] User skipped media step")
-
-    await callback.message.edit_text(
-        "⏭ Медиа пропущено.\n\n"
-        "Теперь добавьте инлайн-кнопки.\n"
-        "Формат: <code>Текст кнопки - https://url.com</code>\n"
-        "Каждая кнопка на новой строке.\n\n"
-        "Или нажмите «Пропустить».",
-        reply_markup=skip_keyboard("skip_buttons"),
-    )
-    await callback.answer()
-
-    await state.set_state(PostWizard.waiting_for_buttons)
+    if len(media_file_ids) >= 10:
+        await _ask_for_buttons(message, state)
+    else:
+        await message.answer(
+            f"📎 Всего в альбоме: {len(media_file_ids)} файл(ов)\n"
+            "Отправьте ещё или нажмите «Готово».",
+            reply_markup=wizard_keyboard(next_step="media", show_done=True),
+        )
 
 
-@router.callback_query(StateFilter(PostWizard.waiting_for_media), F.data == "done_media")
+@router.callback_query(StateFilter(PostWizard.waiting_for_more_media), F.data == "wizard_done_media")
 async def done_media_step(callback: CallbackQuery, state: FSMContext) -> None:
-    """Finish media step."""
-    data = await state.get_data()
-    media_count = len(data.get("media_file_ids", []))
-
-    logger.info(f"[waiting_for_media] User finished media step with {media_count} files")
-
-    await callback.message.edit_text(
-        f"✅ Медиа сохранено ({media_count} файл(ов)).\n\n"
-        "Теперь добавьте инлайн-кнопки.\n"
-        "Формат: <code>Текст кнопки - https://url.com</code>\n"
-        "Каждая кнопка на новой строке.\n\n"
-        "Или нажмите «Пропустить».",
-        reply_markup=skip_keyboard("skip_buttons"),
-    )
+    """Finish adding media."""
+    await callback.message.delete()
     await callback.answer()
-
-    await state.set_state(PostWizard.waiting_for_buttons)
+    await _ask_for_buttons(callback.message, state)
 
 
 # =============================================================================
-# waiting_for_buttons state handlers
+# Step 3: Buttons
 # =============================================================================
 
 @router.message(StateFilter(PostWizard.waiting_for_buttons), F.text)
 async def handle_buttons_input(message: Message, state: FSMContext) -> None:
-    """Handle button definitions input."""
+    """Handle button definitions."""
     from app.utils.telegram import parse_button_text
 
     text = message.text
-    buttons = parse_button_text(text)
+    new_buttons = parse_button_text(text)
 
-    logger.info(f"[waiting_for_buttons] Parsed {len(buttons)} buttons from input")
-
-    if not buttons:
+    if not new_buttons:
         await message.answer(
-            "❌ Не удалось распознать кнопки.\n\n"
-            "Используйте формат:\n"
-            "<code>Текст кнопки - https://url.com</code>\n\n"
-            "Или нажмите «Пропустить».",
-            reply_markup=skip_keyboard("skip_buttons"),
+            "❌ <b>Не удалось распознать кнопки</b>\n\n"
+            "Проверьте формат:\n"
+            "<code>Текст кнопки - https://example.com</code>\n\n"
+            "Разделитель: <code> - </code> (пробел-дефис-пробел)\n\n"
+            "Попробуйте ещё раз или нажмите «Пропустить».",
+            reply_markup=wizard_keyboard(next_step="buttons", show_skip=True),
         )
         return
 
+    # Add to existing buttons
+    data = await state.get_data()
+    buttons = data.get("buttons", [])
+    buttons.extend(new_buttons)
     await state.update_data(buttons=buttons)
 
-    buttons_preview = "\n".join([f"• {btn[0]} → {btn[1]}" for btn in buttons])
+    logger.info(f"[buttons] Added {len(new_buttons)} buttons, total: {len(buttons)}")
+
+    # Show preview with buttons
+    await message.answer(f"✅ Добавлено кнопок: {len(new_buttons)}\n\n👁 <b>Превью поста с кнопками:</b>")
+    await send_post_preview(
+        chat_id=message.chat.id,
+        text=data.get("text", ""),
+        media_file_ids=data.get("media_file_ids", []),
+        media_type=data.get("media_type"),
+        buttons=buttons,
+    )
 
     await message.answer(
-        f"✅ Кнопки добавлены:\n{buttons_preview}\n\n"
-        "Теперь выберите время публикации.\n"
-        "Напишите время или «сейчас» для немедленной публикации.",
-        reply_markup=cancel_keyboard(),
+        f"🔘 Всего кнопок: {len(buttons)}\n\n"
+        "Отправьте ещё кнопки или нажмите «Готово».",
+        reply_markup=wizard_keyboard(next_step="buttons", show_done=True),
     )
 
-    await state.set_state(PostWizard.waiting_for_schedule)
 
-
-@router.callback_query(StateFilter(PostWizard.waiting_for_buttons), F.data == "skip_buttons")
+@router.callback_query(StateFilter(PostWizard.waiting_for_buttons), F.data == "wizard_skip_buttons")
 async def skip_buttons_step(callback: CallbackQuery, state: FSMContext) -> None:
     """Skip buttons step."""
-    logger.info(f"[waiting_for_buttons] User skipped buttons step")
+    await callback.message.delete()
+    await callback.answer()
+    await _ask_for_schedule(callback.message, state)
 
-    await state.update_data(buttons=[])
 
-    await callback.message.edit_text(
-        "⏭ Кнопки пропущены.\n\n"
-        "Теперь выберите время публикации.\n"
-        "Напишите время (например, <code>15:30</code> или <code>завтра 12:00</code>)\n"
-        "или <code>сейчас</code> для немедленной публикации.",
+@router.callback_query(StateFilter(PostWizard.waiting_for_buttons), F.data == "wizard_done_buttons")
+async def done_buttons_step(callback: CallbackQuery, state: FSMContext) -> None:
+    """Finish adding buttons."""
+    await callback.message.delete()
+    await callback.answer()
+    await _ask_for_schedule(callback.message, state)
+
+
+async def _ask_for_schedule(message: Message, state: FSMContext) -> None:
+    """Ask user for publication time."""
+    await state.set_state(PostWizard.waiting_for_schedule)
+
+    await message.answer(
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        "📌 <b>Шаг 4 из 4: Время публикации</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        "Когда опубликовать пост?\n\n"
+        "<b>Примеры форматов:</b>\n"
+        "• <code>сейчас</code> — немедленная публикация\n"
+        "• <code>15:30</code> — сегодня в 15:30\n"
+        "• <code>завтра 15:30</code> — завтра в 15:30\n"
+        "• <code>25.01 15:30</code> — 25 января в 15:30\n"
+        "• <code>25.01.2025 15:30</code> — конкретная дата\n\n"
+        "💡 <i>Время указывается по часовому поясу из настроек бота</i>",
         reply_markup=cancel_keyboard(),
     )
-    await callback.answer()
-
-    await state.set_state(PostWizard.waiting_for_schedule)
 
 
 # =============================================================================
-# waiting_for_schedule state handlers
+# Step 4: Schedule
 # =============================================================================
 
 @router.message(StateFilter(PostWizard.waiting_for_schedule), F.text)
@@ -367,47 +498,93 @@ async def handle_schedule_input(message: Message, state: FSMContext) -> None:
     """Handle schedule time input."""
     from app.services.datetime_parse import parse_datetime, format_datetime
 
-    text = message.text
+    text = message.text.strip()
     parsed_dt, error = parse_datetime(text)
 
     if error:
-        await message.answer(error, reply_markup=cancel_keyboard())
+        await message.answer(
+            f"{error}\n\n"
+            "<b>Примеры:</b>\n"
+            "• <code>сейчас</code>\n"
+            "• <code>15:30</code>\n"
+            "• <code>завтра 12:00</code>\n"
+            "• <code>25.01 18:00</code>",
+            reply_markup=cancel_keyboard(),
+        )
         return
 
-    logger.info(f"[waiting_for_schedule] Parsed datetime: {parsed_dt}")
+    is_immediate = text.lower() in ("сейчас", "now", "немедленно")
+    schedule_str = "немедленно" if is_immediate else format_datetime(parsed_dt)
 
     await state.update_data(scheduled_at=parsed_dt.isoformat() if parsed_dt else None)
 
-    # Show summary
     data = await state.get_data()
-    post_text = data.get("text", "")[:100]
+
+    # Final preview
+    await message.answer(
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        "✅ <b>Пост готов к публикации!</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        "👁 <b>Финальное превью:</b>"
+    )
+
+    await send_post_preview(
+        chat_id=message.chat.id,
+        text=data.get("text", ""),
+        media_file_ids=data.get("media_file_ids", []),
+        media_type=data.get("media_type"),
+        buttons=data.get("buttons", []),
+    )
+
     media_count = len(data.get("media_file_ids", []))
     buttons_count = len(data.get("buttons", []))
 
-    schedule_str = format_datetime(parsed_dt) if text.lower() not in ("сейчас", "now") else "немедленно"
-
     await message.answer(
-        "📋 <b>Сводка поста:</b>\n\n"
-        f"📝 Текст: {post_text}{'...' if len(data.get('text', '')) > 100 else ''}\n"
-        f"🖼 Медиа: {media_count} файл(ов)\n"
-        f"🔘 Кнопок: {buttons_count}\n"
-        f"⏰ Публикация: {schedule_str}\n\n"
-        "<i>Функция сохранения в БД будет добавлена позже.</i>",
+        f"📋 <b>Параметры:</b>\n"
+        f"• Медиа: {media_count} файл(ов)\n"
+        f"• Кнопок: {buttons_count}\n"
+        f"• Публикация: {schedule_str}\n\n"
+        "⚠️ <i>Сохранение в БД будет реализовано в следующем обновлении.</i>\n"
+        "<i>Пока пост не сохраняется.</i>",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="📤 Опубликовать", callback_data="wizard_publish")],
+            [InlineKeyboardButton(text="💾 Сохранить черновик", callback_data="wizard_save_draft")],
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="wizard_cancel")],
+        ]),
     )
 
-    # Clear state for now
-    await state.clear()
-    logger.info("[waiting_for_schedule] Wizard completed (placeholder)")
+    await state.set_state(PostWizard.confirmation)
 
 
 # =============================================================================
-# Cancel button handler
+# Confirmation & Cancel
 # =============================================================================
 
-@router.callback_query(F.data == "cancel")
+@router.callback_query(F.data == "wizard_cancel")
 async def cancel_wizard(callback: CallbackQuery, state: FSMContext) -> None:
-    """Cancel the wizard from inline button."""
+    """Cancel the wizard."""
     await state.clear()
     await callback.message.edit_text("❌ Создание поста отменено.")
     await callback.answer()
-    logger.info(f"User cancelled wizard via inline button")
+
+
+@router.callback_query(StateFilter(PostWizard.confirmation), F.data == "wizard_publish")
+async def publish_immediately(callback: CallbackQuery, state: FSMContext) -> None:
+    """Publish post (placeholder)."""
+    await callback.message.edit_text(
+        "⚠️ <b>Публикация пока не реализована</b>\n\n"
+        "<i>Эта функция будет добавлена после интеграции с базой данных.</i>"
+    )
+    await callback.answer()
+    await state.clear()
+
+
+@router.callback_query(StateFilter(PostWizard.confirmation), F.data == "wizard_save_draft")
+async def save_as_draft(callback: CallbackQuery, state: FSMContext) -> None:
+    """Save as draft (placeholder)."""
+    await callback.message.edit_text(
+        "⚠️ <b>Сохранение черновика пока не реализовано</b>\n\n"
+        "<i>Эта функция будет добавлена после интеграции с базой данных.</i>"
+    )
+    await callback.answer()
+    await state.clear()
