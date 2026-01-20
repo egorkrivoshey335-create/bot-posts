@@ -109,7 +109,7 @@ def edit_post_keyboard(post_id: int) -> InlineKeyboardMarkup:
 def cancel_keyboard() -> InlineKeyboardMarkup:
     """Simple cancel keyboard."""
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="wizard_cancel")],
     ])
 
 
@@ -118,7 +118,7 @@ def skip_keyboard(callback_data: str = "skip") -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [
             InlineKeyboardButton(text="⏭ Пропустить", callback_data=callback_data),
-            InlineKeyboardButton(text="❌ Отмена", callback_data="cancel"),
+            InlineKeyboardButton(text="❌ Отмена", callback_data="wizard_cancel"),
         ],
     ])
 
@@ -128,6 +128,6 @@ def done_keyboard(callback_data: str = "done") -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [
             InlineKeyboardButton(text="✅ Готово", callback_data=callback_data),
-            InlineKeyboardButton(text="❌ Отмена", callback_data="cancel"),
+            InlineKeyboardButton(text="❌ Отмена", callback_data="wizard_cancel"),
         ],
     ])
