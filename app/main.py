@@ -8,6 +8,7 @@ from app.config import get_settings
 from app.db.session import engine
 from app.logging_config import setup_logging
 from app.middlewares.admin_only import AdminOnlyMiddleware
+from app.middlewares.debug_logging import DebugLoggingMiddleware
 from app.routers import common, drafts, edit_published, post_wizard
 from app.services.scheduler import shutdown_scheduler, start_scheduler
 
@@ -20,13 +21,22 @@ def register_routers() -> None:
     dp.include_router(post_wizard.router)
     dp.include_router(drafts.router)
     dp.include_router(edit_published.router)
+    logger.info(f"Registered routers: common, post_wizard, drafts, edit_published")
 
 
 def register_middlewares() -> None:
     """Register middlewares with the dispatcher."""
     settings = get_settings()
+
+    # Debug logging middleware (first, logs everything)
+    dp.message.middleware(DebugLoggingMiddleware())
+
+    # Admin-only middleware (second, filters non-admins)
     dp.message.middleware(AdminOnlyMiddleware(admin_ids=settings.admin_ids))
     dp.callback_query.middleware(AdminOnlyMiddleware(admin_ids=settings.admin_ids))
+
+    logger.info(f"Registered middlewares: DebugLoggingMiddleware, AdminOnlyMiddleware")
+    logger.info(f"Admin IDs: {settings.admin_ids}")
 
 
 async def on_startup() -> None:
