@@ -7,6 +7,7 @@ from aiogram import F, Router
 from aiogram.filters import Command
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 
+from app.config import get_settings
 from app.db.models import PostStatus
 from app.db.repo import DraftPostRepository
 from app.db.session import get_session
@@ -24,6 +25,7 @@ def posts_list_keyboard(
     page: int,
     total_pages: int,
     status_filter: str,
+    show_author: bool = False,
 ) -> InlineKeyboardMarkup:
     """Build keyboard for posts list."""
     kb = []
@@ -38,11 +40,16 @@ def posts_list_keyboard(
         }.get(post.status, "❓")
         
         # Text preview
-        text_preview = (post.text[:25] + "...") if post.text and len(post.text) > 25 else (post.text or "—")
+        text_preview = (post.text[:20] + "...") if post.text and len(post.text) > 20 else (post.text or "—")
+        
+        # Add author for allposts view
+        author_str = ""
+        if show_author and post.author_username:
+            author_str = f"@{post.author_username[:8]} "
         
         kb.append([
             InlineKeyboardButton(
-                text=f"{status_emoji} #{post.id}: {text_preview}",
+                text=f"{status_emoji} #{post.id} {author_str}{text_preview}",
                 callback_data=f"post_view_{post.id}",
             )
         ])
@@ -133,6 +140,55 @@ async def cmd_list_scheduled(message: Message) -> None:
     await _show_posts_list(message, "scheduled")
 
 
+@router.message(Command("allposts"))
+async def cmd_all_posts(message: Message) -> None:
+    """Show all posts from all users (admin only)."""
+    settings = get_settings()
+    user_id = message.from_user.id
+    
+    if user_id not in settings.admin_ids:
+        await message.answer("❌ Эта команда доступна только администраторам.")
+        return
+    
+    await _show_all_posts_list(message, "all")
+
+
+async def _show_all_posts_list(message: Message, status_filter: str, page: int = 0) -> None:
+    """Show all posts from all users (admin view)."""
+    async with get_session() as session:
+        repo = DraftPostRepository(session)
+        
+        status = None
+        if status_filter == "draft":
+            status = PostStatus.DRAFT
+        elif status_filter == "scheduled":
+            status = PostStatus.SCHEDULED
+        elif status_filter == "published":
+            status = PostStatus.PUBLISHED
+        
+        all_posts = await repo.get_all(status=status, limit=100)
+        
+        if not all_posts:
+            await message.answer(
+                "👑 <b>Все посты (админ)</b>\n\n"
+                "<i>Постов нет.</i>"
+            )
+            return
+        
+        total_pages = (len(all_posts) + POSTS_PER_PAGE - 1) // POSTS_PER_PAGE
+        start = page * POSTS_PER_PAGE
+        end = start + POSTS_PER_PAGE
+        posts_page = all_posts[start:end]
+        
+        await message.answer(
+            f"👑 <b>Все посты (админ)</b> ({len(all_posts)} шт.)\n\n"
+            "Выберите пост для просмотра:",
+            reply_markup=posts_list_keyboard(posts_page, page, total_pages, f"admin_{status_filter}", show_author=True),
+        )
+        
+        logger.info(f"Admin {message.from_user.id} requested all posts list")
+
+
 async def _show_posts_list(message: Message, status_filter: str, page: int = 0) -> None:
     """Show posts list with filter."""
     user_id = message.from_user.id
@@ -197,22 +253,29 @@ async def handle_page_change(callback: CallbackQuery) -> None:
     """Handle pagination."""
     parts = callback.data.split("_")
     page = int(parts[2])
-    status_filter = parts[3]
+    status_filter = "_".join(parts[3:])  # Handle admin_all, admin_draft, etc.
     
     user_id = callback.from_user.id
+    is_admin_view = status_filter.startswith("admin_")
     
     async with get_session() as session:
         repo = DraftPostRepository(session)
         
+        # Parse status from filter
+        actual_filter = status_filter.replace("admin_", "") if is_admin_view else status_filter
         status = None
-        if status_filter == "draft":
+        if actual_filter == "draft":
             status = PostStatus.DRAFT
-        elif status_filter == "scheduled":
+        elif actual_filter == "scheduled":
             status = PostStatus.SCHEDULED
-        elif status_filter == "published":
+        elif actual_filter == "published":
             status = PostStatus.PUBLISHED
         
-        all_posts = await repo.get_by_author(user_id, status=status, limit=100)
+        # Get posts based on view type
+        if is_admin_view:
+            all_posts = await repo.get_all(status=status, limit=100)
+        else:
+            all_posts = await repo.get_by_author(user_id, status=status, limit=100)
         
         total_pages = (len(all_posts) + POSTS_PER_PAGE - 1) // POSTS_PER_PAGE
         start = page * POSTS_PER_PAGE
@@ -224,12 +287,17 @@ async def handle_page_change(callback: CallbackQuery) -> None:
             "scheduled": "Запланированные",
             "published": "Опубликованные",
             "all": "Все посты",
-        }.get(status_filter, "Посты")
+        }.get(actual_filter, "Посты")
+        
+        if is_admin_view:
+            title = f"👑 <b>Все посты (админ) - {filter_title}</b>"
+        else:
+            title = f"📋 <b>{filter_title}</b>"
         
         await callback.message.edit_text(
-            f"📋 <b>{filter_title}</b> ({len(all_posts)} шт.)\n\n"
+            f"{title} ({len(all_posts)} шт.)\n\n"
             "Выберите пост для просмотра:",
-            reply_markup=posts_list_keyboard(posts_page, page, total_pages, status_filter),
+            reply_markup=posts_list_keyboard(posts_page, page, total_pages, status_filter, show_author=is_admin_view),
         )
         await callback.answer()
 

@@ -69,6 +69,21 @@ class DraftPostRepository:
         )
         return result.scalars().all()
 
+    async def get_all(
+        self,
+        status: Optional[PostStatus] = None,
+        limit: int = 100,
+    ) -> Sequence[DraftPost]:
+        """Get all posts (for admins)."""
+        stmt = select(DraftPost)
+        
+        if status:
+            stmt = stmt.where(DraftPost.status == status.value)
+        
+        stmt = stmt.order_by(DraftPost.created_at.desc()).limit(limit)
+        result = await self.session.execute(stmt)
+        return result.scalars().all()
+
     async def get_due_for_publishing(self, now: datetime) -> Sequence[DraftPost]:
         """Get posts that are due for publishing."""
         result = await self.session.execute(
